@@ -1,10 +1,11 @@
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Dict
 import soundfile as sf
 import argparse
 import logging
+import openunmix
 
 from model import OpenUnmixLSTM, AudioProcessor
 from dataset import MUSDB18Dataset
@@ -15,13 +16,15 @@ logger = logging.getLogger(__name__)
 
 class Separator:
     """
-    Audio source separator using trained Open-Unmix model.
+    Audio source separator using pretrained Open-Unmix (umxl) model.
     Handles inference, reconstruction, and file I/O.
     """
-    
+
+    TARGETS = ['vocals', 'drums', 'bass', 'other']
+
     def __init__(
         self,
-        checkpoint_path: str,
+        checkpoint_path: str = None,  # kept for CLI/API compatibility; not used
         target: str = 'vocals',
         n_fft: int = 4096,
         hop_length: int = 1024,
@@ -29,99 +32,76 @@ class Separator:
     ):
         """
         Args:
-            checkpoint_path: Path to saved model checkpoint
-            target: Target source to separate
-            n_fft: FFT size
-            hop_length: Hop length for STFT
+            checkpoint_path: Unused; kept for backward compatibility
+            target: Target source to return from separate()
             device: 'cuda' or 'cpu'
         """
         self.device = torch.device(device)
         self.target = target
-        
-        # Load model
-        self.model = OpenUnmixLSTM(
-            input_size=1 + n_fft // 2,
-            hidden_size=512,
-            num_layers=3,
-            num_channels=2,
+
+        # Load pretrained Open-Unmix umxl weights for all 4 stems
+        self.model = openunmix.umxl(
+            targets=self.TARGETS,
+            residual=False,
         )
-        
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(self.device)
         self.model.eval()
-        
-        logger.info(f"✓ Loaded model from {checkpoint_path}")
-        
-        # Audio processor
-        self.processor = AudioProcessor(
-            n_fft=n_fft,
-            hop_length=hop_length,
-            sample_rate=44100,
-        )
+
+        logger.info("✓ Loaded pretrained Open-Unmix umxl model (vocals/drums/bass/other)")
     
-    @torch.no_grad()
-    def separate(self, audio_path: str) -> Tuple[np.ndarray, int]:
-        """
-        Separate source from audio file.
-        
-        Args:
-            audio_path: Path to input audio file
-        
-        Returns:
-            separated_audio: Separated source audio (stereo)
-            sample_rate: Sample rate (44100 Hz)
-        """
-        # Load audio
+    def _load_audio_stereo(self, audio_path: str) -> np.ndarray:
+        """Load audio file and return (channels, samples) stereo float32 array at 44100 Hz."""
         audio, sr = sf.read(audio_path)
-        
-        # Resample if needed
         if sr != 44100:
             import librosa
             audio = librosa.resample(audio, orig_sr=sr, target_sr=44100)
-        
-        # Ensure stereo
         if audio.ndim == 1:
-            audio = np.stack([audio, audio], axis=0)
+            audio = np.stack([audio, audio], axis=0)  # (2, samples)
         else:
             audio = audio.T  # (samples, channels) -> (channels, samples)
-        
+        return audio.astype(np.float32)
+
+    @torch.no_grad()
+    def separate(self, audio_path: str) -> Tuple[np.ndarray, int]:
+        """
+        Separate self.target source from audio file.
+
+        Returns:
+            separated_audio: (channels, samples) float32 array
+            sample_rate: 44100
+        """
+        audio = self._load_audio_stereo(audio_path)  # (channels, samples)
         logger.info(f"Audio shape: {audio.shape}")
-        
-        # Convert to spectrogram
-        mixture_mag, mixture_phase = self.processor.audio_to_magnitude_spectrogram(audio)
-        
-        # Normalize and convert to tensor
-        # (channels, freq_bins, frames) -> (frames, channels, freq_bins)
-        mixture_mag_t = np.transpose(mixture_mag, (2, 0, 1))
-        
-        # Load normalization from model
-        mean = self.model.input_mean.cpu().numpy().squeeze()
-        std = self.model.input_std.cpu().numpy().squeeze()
-        
-        mixture_mag_norm = (mixture_mag_t - mean) / (std + 1e-8)
-        mixture_tensor = torch.from_numpy(mixture_mag_norm).float().unsqueeze(0).to(self.device)
-        
-        logger.info(f"Mixture spectrogram shape: {mixture_tensor.shape}")
-        
-        # Predict mask
-        mask = self.model(mixture_tensor)
-        mask = mask.squeeze(0).cpu().numpy()  # (frames, channels, freq_bins)
-        
-        # Apply mask to get separated magnitude
-        # mask: (frames, channels, freq_bins) -> (channels, freq_bins, frames) to match mixture_mag
-        mask = np.transpose(mask, (1, 2, 0))
-        separated_mag = mixture_mag * mask
-        
-        # Reconstruct audio using original phase
-        separated_audio = self.processor.magnitude_spectrogram_to_audio(
-            separated_mag,
-            mixture_phase
-        )
-        
-        logger.info(f"Separated audio shape: {separated_audio.shape}")
-        
-        return separated_audio, 44100
+
+        # (channels, samples) -> (1, channels, samples)
+        audio_tensor = torch.from_numpy(audio).unsqueeze(0).to(self.device)
+
+        # (1, n_targets, channels, samples)
+        out = self.model(audio_tensor)
+
+        target_idx = self.TARGETS.index(self.target)
+        separated = out[0, target_idx].cpu().numpy()  # (channels, samples)
+
+        logger.info(f"Separated audio shape: {separated.shape}")
+        return separated, 44100
+
+    @torch.no_grad()
+    def separate_all_from_audio(self, audio: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Separate all 4 stems in a single model pass.
+
+        Args:
+            audio: (channels, samples) float32 stereo array at 44100 Hz
+
+        Returns:
+            Dict mapping stem name -> (channels, samples) float32 array
+        """
+        audio_tensor = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0).to(self.device)
+        out = self.model(audio_tensor)  # (1, 4, channels, samples)
+        return {
+            stem: out[0, i].cpu().numpy()
+            for i, stem in enumerate(self.TARGETS)
+        }
     
     def separate_and_save(
         self,
@@ -177,25 +157,15 @@ def evaluate_on_musdb(musdb_path=None, output_dir='./eval_results', checkpoint='
     
     for track in mus:
         logger.info(f"Processing: {track.name}")
-        
-        # Separate all sources
-        estimates = {}
-        
-        for source in ['vocals', 'drums', 'bass', 'other']:
-            separator.target = source
-            
-            # Create temp audio file for this track's mixture
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                sf.write(tmp.name, track.audio, 44100)
-                temp_path = tmp.name
-            
-            try:
-                separated_audio, _ = separator.separate(temp_path)
-                # museval expects (samples, channels), model outputs (channels, samples)
-                estimates[source] = separated_audio.T
-            finally:
-                Path(temp_path).unlink()
+
+        # track.audio is (samples, channels) — convert to (channels, samples) for the model
+        mixture = track.audio.T.astype(np.float32)  # (channels, samples)
+
+        # Single model pass for all 4 stems
+        all_stems = separator.separate_all_from_audio(mixture)
+
+        # museval expects (samples, channels)
+        estimates = {stem: audio.T for stem, audio in all_stems.items()}
         
         # Evaluate using museval
         scores = museval.eval_mus_track(
