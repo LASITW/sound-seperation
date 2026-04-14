@@ -205,14 +205,12 @@ def evaluate_on_musdb(musdb_path=None, output_dir='./eval_results', checkpoint='
         )
         
         all_scores.append(scores)
-        # scores is a TrackStore; log median SDR per target
-        for target in ['vocals', 'drums', 'bass', 'other']:
-            try:
-                sdr_values = scores.scores['targets'][target]['metrics']['SDR']
-                median_sdr = np.nanmedian([v for v in sdr_values if v is not None])
-                logger.info(f"  {target} SDR: {median_sdr:.2f} dB")
-            except (KeyError, TypeError):
-                logger.info(f"  {target} SDR: N/A")
+        # scores.scores["targets"] is a list of {name, frames} dicts
+        for target_data in scores.scores['targets']:
+            target = target_data['name']
+            sdr_values = [f['metrics']['SDR'] for f in target_data['frames'] if f['metrics']['SDR'] is not None]
+            median_sdr = float(np.nanmedian(sdr_values)) if sdr_values else float('nan')
+            logger.info(f"  {target} SDR: {median_sdr:.2f} dB")
     
     logger.info("✓ Evaluation complete!")
 
