@@ -1,8 +1,11 @@
 #!/bin/bash
+# Run with: bash run.sh
 set -e
 
+PYTHON=/Users/noelsaji/opt/anaconda3/bin/python3
+
 # Install API dependencies if needed
-pip install -r requirements_api.txt -q
+"$PYTHON" -m pip install -r requirements_api.txt -q
 
 # Create runtime directories
 mkdir -p uploads outputs
@@ -11,4 +14,4 @@ mkdir -p uploads outputs
 (sleep 1.5 && open http://localhost:8000) &
 
 # Start the server
-uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+"$PYTHON" -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
