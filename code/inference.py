@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from pathlib import Path
+from typing import Tuple
 import soundfile as sf
 import argparse
 import logging
@@ -108,7 +109,9 @@ class Separator:
         mask = mask.squeeze(0).cpu().numpy()  # (frames, channels, freq_bins)
         
         # Apply mask to get separated magnitude
-        separated_mag = mixture_mag * mask.T[np.newaxis, :, :]  # Transpose back
+        # mask: (frames, channels, freq_bins) -> (channels, freq_bins, frames) to match mixture_mag
+        mask = np.transpose(mask, (1, 2, 0))
+        separated_mag = mixture_mag * mask
         
         # Reconstruct audio using original phase
         separated_audio = self.processor.magnitude_spectrogram_to_audio(
@@ -143,7 +146,7 @@ class Separator:
         logger.info(f"✓ Saved separated audio to {output_path}")
 
 
-def evaluate_on_musdb():
+def evaluate_on_musdb(musdb_path=None, output_dir='./eval_results', checkpoint='./checkpoints/best_model.pt'):
     """
     Evaluate model on MUSDB18 test set using museval metrics.
     """
@@ -155,16 +158,19 @@ def evaluate_on_musdb():
     # Load model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     separator = Separator(
-        checkpoint_path='./checkpoints/best_model.pt',
+        checkpoint_path=checkpoint,
         target='vocals',
         device=str(device),
     )
     
     # Load test set
-    mus = musdb.DB(subsets='test')
+    mus_kwargs = {'subsets': 'test'}
+    if musdb_path:
+        mus_kwargs['root'] = musdb_path
+    mus = musdb.DB(**mus_kwargs)
     
     # Create output directory
-    output_dir = Path('./eval_results')
+    output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
     
     all_scores = []
@@ -186,7 +192,8 @@ def evaluate_on_musdb():
             
             try:
                 separated_audio, _ = separator.separate(temp_path)
-                estimates[source] = separated_audio
+                # museval expects (samples, channels), model outputs (channels, samples)
+                estimates[source] = separated_audio.T
             finally:
                 Path(temp_path).unlink()
         
@@ -198,18 +205,25 @@ def evaluate_on_musdb():
         )
         
         all_scores.append(scores)
-        logger.info(f"  Vocals SDR: {scores[0]['vocal'][0]:.2f}")
+        # scores is a TrackStore; log median SDR per target
+        for target in ['vocals', 'drums', 'bass', 'other']:
+            try:
+                sdr_values = scores.scores['targets'][target]['metrics']['SDR']
+                median_sdr = np.nanmedian([v for v in sdr_values if v is not None])
+                logger.info(f"  {target} SDR: {median_sdr:.2f} dB")
+            except (KeyError, TypeError):
+                logger.info(f"  {target} SDR: N/A")
     
     logger.info("✓ Evaluation complete!")
 
 
 def main():
     parser = argparse.ArgumentParser(description='Audio source separation inference')
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/best_model.pt',
+    parser.add_argument('--checkpoint', type=str, default='./code/checkpoints/best_model.pt',
                        help='Path to model checkpoint')
-    parser.add_argument('--audio', type=str, required=True,
+    parser.add_argument('--audio', type=str, default=None,
                        help='Path to input audio file')
-    parser.add_argument('--output', type=str, required=True,
+    parser.add_argument('--output', type=str, default=None,
                        help='Path to output audio file')
     parser.add_argument('--target', type=str, default='vocals',
                        choices=['vocals', 'drums', 'bass', 'other'],
@@ -219,12 +233,18 @@ def main():
                        help='Device to use')
     parser.add_argument('--evaluate', action='store_true',
                        help='Evaluate on MUSDB18 test set')
+    parser.add_argument('--musdb_path', type=str, default=None,
+                       help='Path to MUSDB18 dataset root')
+    parser.add_argument('--output_dir', type=str, default='./eval_results',
+                       help='Directory to save evaluation results')
     
     args = parser.parse_args()
     
     if args.evaluate:
-        evaluate_on_musdb()
+        evaluate_on_musdb(musdb_path=args.musdb_path, output_dir=args.output_dir, checkpoint=args.checkpoint)
     else:
+        if not args.audio or not args.output:
+            parser.error('--audio and --output are required when not using --evaluate')
         separator = Separator(
             checkpoint_path=args.checkpoint,
             target=args.target,
